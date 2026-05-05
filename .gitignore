@@ -1,0 +1,16 @@
+.venv/
+*.pyc
+**/__pycache__/
+collect/data/json/
+collect/data/raw/
+collect/data/example/
+model/bert-base-chinese/
+*.csv
+*.jsonl
+*.html
+*.ori
+*.log
+*.exe
+*.pt
+*.safetensors
+*.0
