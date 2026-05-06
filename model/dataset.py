@@ -46,56 +46,50 @@ class SarkazCharmap():
         if not rows:
             raise ValueError(f"地图文件 {map_file} 为空或未找到有效行")
 
-        # 保证所有行宽度一致，较短的行用 False 填充
+        # 保证所有行宽度一致
         width = max(len(r) for r in rows)
         for r in rows:
-            if len(r) < width:
-                r.extend([False] * (width - len(r)))
+            assert len(r) == width
+
+        # 验证合法 char 对应数量
+        assert len(chars) == 26
 
         self.chars = chars
         self.char_to_index = {c: i for i, c in enumerate(self.chars)}
         self.output = torch.tensor(rows, dtype=torch.bool)
 
         # 输入侧 core token 使用 1-26 表示 a-z；其余 id 视为无有效映射。
-        # 这里映射 100 是为了方便之后添加其它 token, 实际上多余的部分最后都是 -1
-        self._input_id_to_row_index = torch.full((100,), -1, dtype=torch.long)
-        for idx in range(1, min(len(self.chars), 26) + 1):
+        self._input_id_to_row_index = torch.full((27,), -1, dtype=torch.long)
+        for idx in range(1, 26 + 1):
             self._input_id_to_row_index[idx] = idx - 1
 
     def index_of(self, ch: str) -> int:
         """返回字符对应的行索引，找不到抛出 KeyError。"""
         return self.char_to_index[ch]
 
-    def map_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """将 input_ids 的 core 区间映射成 (batch, len[3:-1], dict_size) 的布尔张量。"""
-        if not torch.is_tensor(input_ids):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
+    def map_core_ids(self, core_ids: torch.Tensor) -> torch.Tensor:
+        """将 core_ids 映射成 (batch, seq_len, dict_size) 的布尔张量。"""
+        if not torch.is_tensor(core_ids):
+            core_ids = torch.tensor(core_ids, dtype=torch.long)
 
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
+        assert core_ids.dim() == 2, "core_ids 应该是 (batch_size, seq_len) 的二维张量"
 
-        if input_ids.dim() != 2:
-            raise ValueError("input_ids must have shape (batch, len)")
+        # core_ids = core_ids.long()
+        # batch_size, seq_len = core_ids.shape
+        # dict_size = self.output.size(1)
+        # assert seq_len != 0
 
-        core_input_ids = input_ids[:, 3:-1].long()
-        batch_size, seq_len = core_input_ids.shape
-        dict_size = self.output.size(1)
-
-        if seq_len == 0:
-            return torch.zeros((batch_size, 0, dict_size), dtype=torch.bool, device=core_input_ids.device)
-
-        device = core_input_ids.device
+        device = core_ids.device
         lookup = self._input_id_to_row_index.to(device)
         output = self.output.to(device)
         
-        safe_input_ids = core_input_ids.clamp(min=0, max=lookup.size(0) - 1)
-        row_indices = lookup[safe_input_ids]
-
-        mapped = output[row_indices.clamp(min=0)]
+        # safe_core_ids = core_ids.clamp(min=0, max=lookup.size(0) - 1)
+        # 从 id 到 map idx
+        row_indices = lookup[core_ids]
+        # 从 map idx 布尔图
+        mapped = output[row_indices]
         invalid_mask = row_indices < 0
-        if invalid_mask.any():
-            mapped = mapped.masked_fill(invalid_mask.unsqueeze(-1), False)
-
+        mapped[invalid_mask] = False
         return mapped
 
 class SarkazDataset(Dataset):
@@ -146,30 +140,37 @@ class SarkazDataset(Dataset):
                     print(f"⚠️  Skipping line {line_no}: {e}")
                     continue
                     
-                if len(encoded_sample["input_ids"]) > max_length:
-                    # Keep CLS, magic, SEP, and as much core as possible, then the trailing SEP.
-                    core_max = max_length - 4
+                head_len = len(encoded_sample["head_ids"])
+                if head_len > max_length:
+                    print(f"⚠️  Skipping line {line_no}: max_length={max_length} too small for head_ids length={head_len}")
+                    continue
+
+                if head_len + len(encoded_sample["core_ids"]) > max_length:
+                    # Keep head_ids fixed, and truncate the core part to fit max_length.
+                    core_max = max_length - head_len
                     if core_max <= 0:
                         print(f"⚠️  Skipping line {line_no}: max_length={max_length} too small")
                         continue
 
-                    core_len = min(len(encoded_sample["token_mask"]), core_max)
+                    core_len = min(len(encoded_sample["core_ids"]), len(encoded_sample["target_ids"]), len(encoded_sample["token_mask"]), core_max)
 
                     # 严格验证截断长度一致性
+                    core_ids = encoded_sample["core_ids"][:core_len]
                     target_core = encoded_sample["target_ids"][:core_len]
                     mask_core = encoded_sample["token_mask"][:core_len]
-                    assert len(target_core) == core_len and len(mask_core) == core_len, \
-                        f"Line {line_no}: Truncation length mismatch after slicing (target={len(target_core)}, mask={len(mask_core)}, expected={core_len})"
+                    assert len(core_ids) == core_len and len(target_core) == core_len and len(mask_core) == core_len, \
+                        f"Line {line_no}: Truncation length mismatch after slicing (core={len(core_ids)}, target={len(target_core)}, mask={len(mask_core)}, expected={core_len})"
                     
                     encoded_sample = {
-                        "input_ids": encoded_sample["input_ids"][:3 + core_len] + [tokenizer.sep_id],
+                        "head_ids": encoded_sample["head_ids"],
+                        "core_ids": core_ids,
                         "target_ids": target_core,
                         "token_mask": mask_core,
                     }
                     
                     # 验证截断后形状
-                    assert len(encoded_sample["input_ids"]) == 4 + core_len, \
-                        f"Line {line_no}: After truncation, input_ids should have length {4 + core_len}, got {len(encoded_sample['input_ids'])}"
+                    assert len(encoded_sample["head_ids"]) == head_len and len(encoded_sample["core_ids"]) == core_len, \
+                        f"Line {line_no}: After truncation, head_ids should have length {head_len} and core_ids should have length {core_len}"
                     assert len(encoded_sample["target_ids"]) == core_len and len(encoded_sample["token_mask"]) == core_len, \
                         f"Line {line_no}: After truncation, target_ids and token_mask should have length {core_len}"
 

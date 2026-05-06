@@ -1,9 +1,11 @@
 {
     "cSpell.words": [
         "autocast",
+        "nhead",
         "pbar",
         "pooler",
         "preds",
+        "reconstructor",
         "wikidat_deserialize"
     ]
 }

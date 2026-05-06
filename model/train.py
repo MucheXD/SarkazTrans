@@ -32,21 +32,22 @@ def get_args():
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--validate-share", type=float, default=0.12)
     p.add_argument("--epochs", type=int, default=60)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--embedding-lr", type=float, default=6e-5, help="Learning rate for BERT embeddings")
+    p.add_argument("--batch-size", type=int, default=64) # check before run
+    p.add_argument("--embedding-lr", type=float, default=8e-5, help="Learning rate for custom embeddings")
+    p.add_argument("--bert-emb-lr", type=float, default=4e-5, help="Learning rate for BERT embeddings")
     p.add_argument("--bert-low-lr", type=float, default=2e-5, help="Learning rate for BERT encoder layers 1-4")
     p.add_argument("--bert-mid-lr", type=float, default=1e-5, help="Learning rate for BERT encoder layers 5-8")
     p.add_argument("--bert-high-lr", type=float, default=2e-5, help="Learning rate for BERT encoder layers 9-12 and pooler")
-    p.add_argument("--head-lr", type=float, default=1e-4, help="Learning rate for the mapper head")
+    p.add_argument("--head-lr", type=float, default=8e-5, help="Learning rate for the mapper head")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--log-interval", type=int, default=100)
-    p.add_argument("--validate-interval", type=int, default=1000, help="Validate every N steps (set to 0 to disable step-based validation)")
-    p.add_argument("--enable-amp", type=bool, default=True, help="Enable automatic mixed precision for faster training and reduced memory usage (default: True)")
-    p.add_argument("--enable-gradient-checkpointing", type=bool, default=False, help="Enable gradient checkpointing to reduce GPU memory (default: True)")
+    p.add_argument("--validate-interval", type=int, default=2000, help="Validate every N steps (set to 0 to disable step-based validation)")
+    p.add_argument("--enable-amp", type=bool, default=True, help="Enable automatic mixed precision for faster training and reduced memory usage")
+    p.add_argument("--enable-gradient-checkpointing", type=bool, default=False, help="Enable gradient checkpointing to reduce GPU memory")
     p.add_argument("--train-level", type=int, default=0, help="Current training level for multi-level training (default 0)")
-    p.add_argument("--max-samples", type=int, default=0, help="Limit number of samples, set to >0 for quick tests")
-    p.add_argument("--loader-workers", type=int, default=1, help="Number of DataLoader workers")
+    p.add_argument("--max-samples", type=int, default=0 , help="Limit number of samples, set to >0 for quick tests")
+    p.add_argument("--loader-workers", type=int, default=4, help="Number of DataLoader workers")
     p.add_argument("--accumulation-steps", type=int, default=1, help="Number of steps to accumulate gradients for (default 4)")
     return p.parse_args()
 
@@ -119,7 +120,7 @@ def main():
     bert = BertModel.from_pretrained(str(bert_model_dir))
     model = SarkazBert(bert)
 
-    # 四套学习率：embedding / BERT low-mid-high / mapper head
+    # 学习率分组：custom embedding / BERT embeddings / BERT low-mid-high / mapper head
     bert_layers = model.bert_model.encoder.layer
 
     def layer_params(start: int, end: int):
@@ -134,7 +135,8 @@ def main():
 
     optimizer = AdamW(
         [
-            {"params": model.bert_model.embeddings.parameters(), "lr": args.embedding_lr},
+            {"params": model.embedding.parameters(), "lr": args.embedding_lr},
+            {"params": model.bert_model.embeddings.parameters(), "lr": args.bert_emb_lr},
             {"params": layer_params(0, 4), "lr": args.bert_low_lr},
             {"params": layer_params(4, 8), "lr": args.bert_mid_lr},
             {"params": layer_params(8, 12), "lr": args.bert_high_lr},
@@ -144,6 +146,7 @@ def main():
     print(
         "Optimizer lr groups: "
         f"embedding_lr={args.embedding_lr:.6g}, "
+        f"bert_emb_lr={args.bert_emb_lr:.6g}, "
         f"bert_low_lr={args.bert_low_lr:.6g}, "
         f"bert_mid_lr={args.bert_mid_lr:.6g}, "
         f"bert_high_lr={args.bert_high_lr:.6g}, "
@@ -156,7 +159,7 @@ def main():
     print(f"Target total training steps: {target_steps}")
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 # 设置预热 避免初期随机初始化的层破坏 bert 的预训练权重
-                                                num_warmup_steps = max(1000, target_steps // 20),
+                                                num_warmup_steps = max(500, target_steps // 15),
                                                 num_training_steps = target_steps)
 
     # 尝试加载最后一次训练检查点
@@ -204,7 +207,7 @@ def main():
         optimizer=optimizer,
         scheduler=scheduler,
         model_saver=model_saver,
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.01),
+        criterion = nn.CrossEntropyLoss(),
         device_str=device,
         enable_amp=args.enable_amp,
         enable_gradient_checkpointing=args.enable_gradient_checkpointing,

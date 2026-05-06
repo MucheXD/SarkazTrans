@@ -67,12 +67,13 @@ class SarkazBertTrainer:
         if self.enable_amp:
             self.grad_scaler = torch.amp.grad_scaler.GradScaler()
 
-    def _calc_loss(self, input_ids: torch.Tensor, output_logics: torch.Tensor, token_mask: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    def _calc_loss(self, core_ids: torch.Tensor, output_logics: torch.Tensor, token_mask: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
         """
         计算掩码后的交叉熵损失。
 
         Args:
-            input_ids: Tensor of shape (batch, seq_len) — 输入的 token IDs。
+            head_ids: Tensor of shape (batch, seq_len) — 头部 token IDs。
+            core_ids: Tensor of shape (batch, seq_len) — 核心 token IDs。
             output_logics: Tensor of shape (batch, seq_len, dict_size) — 模型预测的 logits（已由 mapper 切片）。
             token_mask: Tensor of shape (batch, seq_len) — 0/1 掩码，1 表示该位置参与损失计算。
             target_ids: Tensor of shape (batch, seq_len) — 目标 id。
@@ -91,7 +92,19 @@ class SarkazBertTrainer:
 
         # 获取硬规则掩码
         # 硬规则帮助模型专注学习有效输出的特定子集，忽略无效位置的预测
-        char_mask = self.sarkaz_mapping.map_input_ids(input_ids).to(self.device_str)
+        char_mask = self.sarkaz_mapping.map_core_ids(core_ids).to(self.device_str)
+        # 目标 token 对应的 logits 位置必须保留，否则说明映射或数据存在错误
+        # token_mask_bool = token_mask.to(self.device_str).bool()
+        # target_allowed = char_mask.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1)
+        # target_allowed = target_allowed | ~token_mask_bool
+        # if not target_allowed.all():
+        #     bad_positions = (~target_allowed).nonzero(as_tuple=False)
+        #     first_bad = bad_positions[0].tolist()
+        #     bad_target_id = target_ids[first_bad[0], first_bad[1]].item()
+        #     raise RuntimeError(
+        #         "Target token is masked out by char_mask at position "
+        #         f"(batch={first_bad[0]}, seq={first_bad[1]}), target_id={bad_target_id}"
+        #     )
         # 应用硬规则掩码，将无效位置的 logits 设置为一个很小的值，使其在 softmax 后接近于 0
         output_logics = output_logics.masked_fill(~char_mask, self.hard_mask)
 
@@ -100,14 +113,32 @@ class SarkazBertTrainer:
         # 例如：输入 aaa[bb]ccc 输出的 4,7 位置不做损失计算
         logits, targets, mask = self._flatten_core_logits(output_logics, target_ids, token_mask, vocab_size, ensure_device_str=self.device_str)
 
+        # 在进入 criterion 前再检查一次：参与监督的位置上，目标类别的 logit 不能已经被 hard_mask 掉
+        # supervised_logits = 
+        # supervised_targets = 
+        # target_class_logits = supervised_logits.gather(1, supervised_targets.unsqueeze(1)).squeeze(1)
+        # bad_positions = (target_class_logits == self.hard_mask).nonzero(as_tuple=False).flatten()
+        # if bad_positions.numel() > 0:
+        #     first_bad = bad_positions[0].item()
+        #     flat_indices = mask.nonzero(as_tuple=False).squeeze(1)
+        #     flat_idx = flat_indices[first_bad].item()
+        #     batch_idx = flat_idx // token_mask.size(1)
+        #     seq_idx = flat_idx % token_mask.size(1)
+        #     bad_target_id = supervised_targets[first_bad].item()
+        #     raise RuntimeError(
+        #         "Target-class logit is hard-masked before criterion at position "
+        #         f"(batch={batch_idx}, seq={seq_idx}), target_id={bad_target_id}, hard_mask={self.hard_mask}"
+        #     )
+        #  = supervised_logits
+        #  = supervised_targets
+
         # 如果没有有效位置，返回 0.0（带 grad）以避免断图
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=self.device_str, requires_grad=True)
+        # if mask.sum() == 0:
+        #     return torch.tensor(0.0, device=self.device_str, requires_grad=True)
 
-        logits = logits[mask]
-        targets = targets[mask]
+        assert mask.sum() > 0, "No valid positions to compute loss (token_mask may be all zeros)"
 
-        return self.criterion(logits, targets)
+        return self.criterion(logits[mask], targets[mask])
 
     def token_accuracy(
         self,
@@ -198,7 +229,7 @@ class SarkazBertTrainer:
         for batch_idx, batch in enumerate(self.train_loader): # 遍历训练数据加载器中的每个 batch
             # 在首个 batch 时检查 batch_size 是否可以被 accumulation_steps 整除
             if batch_idx == 0:
-                batch_size = batch["input_ids"].size(0)
+                batch_size = batch["head_ids"].size(0)
                 assert batch_size % self.accumulation_steps == 0, \
                     f"batch_size ({batch_size}) must be divisible by accumulation_steps ({self.accumulation_steps})"
             
@@ -207,26 +238,27 @@ class SarkazBertTrainer:
                 self.optimizer.zero_grad() # 重置梯度
             
             # 载入到设备
-            input_ids = batch["input_ids"].to(self.device_str)
+            head_ids = batch["head_ids"].to(self.device_str)
+            core_ids = batch["core_ids"].to(self.device_str)
             attention_mask = batch["attention_mask"].to(self.device_str)
             token_mask = batch["token_mask"].to(self.device_str)
             target_ids = batch["target_ids"].to(self.device_str)
             
             # 数据形状验证：确保批次正确对齐
-            batch_size = input_ids.size(0)
-            assert batch_size == token_mask.size(0) == target_ids.size(0), \
-                f"Batch size mismatch: input_ids {input_ids.shape} vs token_mask {token_mask.shape} vs target_ids {target_ids.shape}"
+            batch_size = head_ids.size(0)
+            assert batch_size == core_ids.size(0) == token_mask.size(0) == target_ids.size(0), \
+                f"Batch size mismatch: head_ids {head_ids.shape} vs core_ids {core_ids.shape} vs token_mask {token_mask.shape} vs target_ids {target_ids.shape}"
             
             # 前向传播和损失计算
             # 注意: 前向传播的掩码是 attention_mask 因为特殊字符需要被模型注意到
             # 然而损失计算使用 token_mask 因为特殊字符是不体现在输出的
             if self.enable_amp:
                 with autocast(device_type=self.device_str):
-                    output_logits = self.model(input_ids, attention_mask)
-                    loss = self._calc_loss(input_ids, output_logits, token_mask, target_ids)
+                    output_logits = self.model(head_ids, core_ids, attention_mask)
+                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
             else:
-                output_logits = self.model(input_ids, attention_mask)
-                loss = self._calc_loss(input_ids, output_logits, token_mask, target_ids)
+                output_logits = self.model(head_ids, core_ids, attention_mask)
+                loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
 
             # 对损失进行缩放以实现梯度累积
             scaled_loss = loss / self.accumulation_steps
@@ -280,11 +312,6 @@ class SarkazBertTrainer:
                 if self._update_validation_state(val_loss, val_top5, self.current_epoch):
                     print(f"\nEarly stopping triggered")
                     break
-
-        # 处理 epoch 末尾未完成的梯度累积
-        # 如果累积未完成（batch_idx % accumulation_steps != 0），需要 zero_grad 避免梯度泄漏到下一个 epoch
-        if (batch_idx + 1) % self.accumulation_steps != 0:
-            self.optimizer.zero_grad()
         
         # 再次断言以确保有效批次数可以被累积步数整除（如果不满足说明代码逻辑有误）
         assert valid_batches % self.accumulation_steps == 0
@@ -310,7 +337,8 @@ class SarkazBertTrainer:
         with torch.inference_mode():
             for batch in self.val_loader:
                 # Move batch to device
-                input_ids = batch["input_ids"].to(self.device_str)
+                head_ids = batch["head_ids"].to(self.device_str)
+                core_ids = batch["core_ids"].to(self.device_str)
                 attention_mask = batch["attention_mask"].to(self.device_str)
                 token_mask = batch["token_mask"].to(self.device_str)
                 target_ids = batch["target_ids"].to(self.device_str)
@@ -318,11 +346,11 @@ class SarkazBertTrainer:
                 # Forward pass
                 if self.enable_amp:
                     with autocast(device_type=self.device_str):
-                        output_logits = self.model(input_ids, attention_mask)
-                        loss = self._calc_loss(input_ids, output_logits, token_mask, target_ids)
+                        output_logits = self.model(head_ids, core_ids, attention_mask)
+                        loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
                 else:
-                    output_logits = self.model(input_ids, attention_mask)
-                    loss = self._calc_loss(input_ids, output_logits, token_mask, target_ids)
+                    output_logits = self.model(head_ids, core_ids, attention_mask)
+                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
                 
                 # Compute metrics (top1 and top5)
                 logits_flat, targets_flat, mask_flat = self._flatten_core_logits(output_logits, target_ids, token_mask, output_logits.size(-1), ensure_device_str=self.device_str)
@@ -406,7 +434,6 @@ class SarkazBertTrainer:
             # 记录到 TensorBoard（训练/验证统计） —— 学习率在 train_epoch 的 log_interval 中记录
             if self.summary_logger:
                 self.summary_logger.log_train_epoch(epoch, train_loss, train_top1, train_top5)
-                is_best = val_top5 > (self.history_stats['val_metric'][epoch-1] if epoch > 0 and self.history_stats['val_metric'] else 0)
                 self.summary_logger.log_validation(epoch, val_loss, val_top1, val_top5, is_best=val_top5 > self.best_score)
             
             # 更新验证状态并检查是否触发早停（以 Val Top5 为主指标）
