@@ -13,7 +13,7 @@ class SarkazBert(nn.Module):
     super().__init__()
     
     # Layer1 - Reconstructor
-    self.embedding = nn.Embedding(num_embeddings=31, embedding_dim=768)
+    self.embedding = nn.Embedding(num_embeddings=30, embedding_dim=768)
     self.reconstructor_mlp = nn.Sequential(
       nn.Linear(768, 768),
       nn.GELU(),
@@ -36,10 +36,16 @@ class SarkazBert(nn.Module):
     # 初始化：Xavier 初始化对 Linear 层通常效果更好
     nn.init.xavier_uniform_(self.mapper.weight)
 
-  def forward(self, head_ids: torch.Tensor, core_ids: torch.Tensor, attention_mask: torch.Tensor):
+  def forward(
+    self,
+    head_ids: torch.Tensor,
+    core_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    token_type_ids: torch.Tensor,
+  ):
 
     # head 部分继续使用 BERT 原始 embedding，保留 CLS / TYPE / SEP 的预训练表示
-    head_embeddings = self.bert_model.embeddings(input_ids=head_ids)
+    head_embeddings = self.bert_model.embeddings.word_embeddings(head_ids)
 
     # core 部分使用自定义 embedding，并经过重建层变换
     core_embeddings = self.embedding(core_ids)
@@ -52,7 +58,8 @@ class SarkazBert(nn.Module):
     # 送入 BERT 核心层
     bert_outputs = self.bert_model(
         inputs_embeds=new_embeddings,
-        attention_mask=attention_mask
+        attention_mask=attention_mask,
+        token_type_ids=token_type_ids
     )
 
     # 使用 last_hidden_state

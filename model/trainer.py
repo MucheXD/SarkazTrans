@@ -224,7 +224,7 @@ class SarkazBertTrainer:
         total_loss = 0.0
         total_accuracy_top1 = 0.0
         total_accuracy_top5 = 0.0
-        valid_batches = 0
+        num_batches = 0  # 直接跟踪处理的实际 batch 数
         
         for batch_idx, batch in enumerate(self.train_loader): # 遍历训练数据加载器中的每个 batch
             # 在首个 batch 时检查 batch_size 是否可以被 accumulation_steps 整除
@@ -241,6 +241,7 @@ class SarkazBertTrainer:
             head_ids = batch["head_ids"].to(self.device_str)
             core_ids = batch["core_ids"].to(self.device_str)
             attention_mask = batch["attention_mask"].to(self.device_str)
+            token_type_ids = batch["token_type_ids"].to(self.device_str)
             token_mask = batch["token_mask"].to(self.device_str)
             target_ids = batch["target_ids"].to(self.device_str)
             
@@ -254,10 +255,10 @@ class SarkazBertTrainer:
             # 然而损失计算使用 token_mask 因为特殊字符是不体现在输出的
             if self.enable_amp:
                 with autocast(device_type=self.device_str):
-                    output_logits = self.model(head_ids, core_ids, attention_mask)
+                    output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
                     loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
             else:
-                output_logits = self.model(head_ids, core_ids, attention_mask)
+                output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
                 loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
 
             # 对损失进行缩放以实现梯度累积
@@ -266,6 +267,7 @@ class SarkazBertTrainer:
             # 反向传播和优化
             if self.enable_amp:
                 self.grad_scaler.scale(scaled_loss).backward()
+                # 从这一步开始 数学上 batch 已经完成 后续使用 batch_idx 都需要增加 1
                 # 仅在累积完成时执行 optimizer.step()
                 if (batch_idx + 1) % self.accumulation_steps == 0:
                     self.grad_scaler.step(self.optimizer)
@@ -276,15 +278,15 @@ class SarkazBertTrainer:
                 if (batch_idx + 1) % self.accumulation_steps == 0:
                     self.optimizer.step()
             
-            # 仅在累积完成时更新学习率
-            if (batch_idx + 1) % self.accumulation_steps == 0:
-                self.scheduler.step()
+            # 累积完成时更新学习率
+            # 注意: 调度器 step 应该每个 batch 调用以配合 Batch 语义
+            self.scheduler.step()
 
-            # 增加计数（仅在累积完成时增加）
+            # 增加计数（仅在累积完成时增加全局步数），并累加 loss/metric（按原始 batch 口径）
             if (batch_idx + 1) % self.accumulation_steps == 0:
                 self.global_step += 1
             total_loss += loss.item()
-            valid_batches += 1
+            num_batches += 1
             
             # 计算 Batch top1 和 top5 准确率
             with torch.inference_mode():
@@ -311,14 +313,13 @@ class SarkazBertTrainer:
                 # 若触发早停，则退出训练循环（使用 top5 作为监控指标）
                 if self._update_validation_state(val_loss, val_top5, self.current_epoch):
                     print(f"\nEarly stopping triggered")
+                    self.model.train()
                     break
+                self.model.train()
         
-        # 再次断言以确保有效批次数可以被累积步数整除（如果不满足说明代码逻辑有误）
-        assert valid_batches % self.accumulation_steps == 0
-        
-        avg_loss = total_loss / valid_batches if valid_batches > 0 else 0.0
-        avg_top1 = total_accuracy_top1 / valid_batches if valid_batches > 0 else 0.0
-        avg_top5 = total_accuracy_top5 / valid_batches if valid_batches > 0 else 0.0
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_top1 = total_accuracy_top1 / num_batches if num_batches > 0 else 0.0
+        avg_top5 = total_accuracy_top5 / num_batches if num_batches > 0 else 0.0
         return avg_loss, avg_top1, avg_top5
 
     def validate(self) -> Tuple[float, float, float]:
@@ -340,16 +341,17 @@ class SarkazBertTrainer:
                 head_ids = batch["head_ids"].to(self.device_str)
                 core_ids = batch["core_ids"].to(self.device_str)
                 attention_mask = batch["attention_mask"].to(self.device_str)
+                token_type_ids = batch["token_type_ids"].to(self.device_str)
                 token_mask = batch["token_mask"].to(self.device_str)
                 target_ids = batch["target_ids"].to(self.device_str)
                 
                 # Forward pass
                 if self.enable_amp:
                     with autocast(device_type=self.device_str):
-                        output_logits = self.model(head_ids, core_ids, attention_mask)
+                        output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
                         loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
                 else:
-                    output_logits = self.model(head_ids, core_ids, attention_mask)
+                    output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
                     loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
                 
                 # Compute metrics (top1 and top5)
