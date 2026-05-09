@@ -1,7 +1,7 @@
 from pathlib import Path
 import torch.nn as nn
 import torch
-from transformers import BertModel, BertConfig
+from transformers import BertForMaskedLM, BertConfig
 
 _BASE_DIR = Path(__file__).resolve().parent
 _BERT_MODEL_DIR = _BASE_DIR / "bert-base-chinese"
@@ -9,8 +9,9 @@ _BERT_MODEL_DIR = _BASE_DIR / "bert-base-chinese"
 bert_config = BertConfig.from_pretrained(str(_BERT_MODEL_DIR))
 
 class SarkazBert(nn.Module):
-  def __init__(self, bert_model: BertModel, dict_size=8100):
+  def __init__(self, mlm_model: BertForMaskedLM, dict_size=8100):
     super().__init__()
+    self.dict_size = dict_size
     
     # Layer1 - Reconstructor
     self.embedding = nn.Embedding(num_embeddings=30, embedding_dim=768)
@@ -22,19 +23,20 @@ class SarkazBert(nn.Module):
     )
     self.reconstructor_norm = nn.LayerNorm(768)
 
-    # Layer2 - BertModel 使用预训练的 BertModel
-    self.bert_model = bert_model
+    # Layer2 - BertModel 与 MLM head 都来自预训练权重
+    self.bert_model = mlm_model.bert
+    self.mlm_head = mlm_model.cls
     
     self.drop_and_norm = nn.Sequential(
       nn.Dropout(0.2),
-      nn.LayerNorm(bert_model.config.hidden_size)
+      nn.LayerNorm(self.bert_model.config.hidden_size)
     )
 
-    # Layer3 - Mapper 将 Bert 的输出映射到目标词表大小
-    self.mapper = nn.Linear(bert_model.config.hidden_size, dict_size)
-
-    # 初始化：Xavier 初始化对 Linear 层通常效果更好
-    nn.init.xavier_uniform_(self.mapper.weight)
+  def set_bert_trainable(self, trainable: bool) -> None:
+    for param in self.bert_model.parameters():
+      param.requires_grad = trainable
+    for param in self.mlm_head.parameters():
+      param.requires_grad = trainable
 
   def forward(
     self,
@@ -71,4 +73,7 @@ class SarkazBert(nn.Module):
     # 对切片后的输出进行 Dropout 和 LayerNorm
     sliced_output = self.drop_and_norm(sliced_output)
     
-    return self.mapper(sliced_output)
+    full_logits = self.mlm_head(sliced_output)
+    logits = full_logits[:, :, : self.dict_size]
+    assert logits.size(-1) == self.dict_size, "MLM logits were not sliced to dict_size"
+    return logits

@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset, random_split
 from torch.optim import AdamW
 
-from transformers import BertModel, get_linear_schedule_with_warmup
+from transformers import BertForMaskedLM, get_linear_schedule_with_warmup
 
 from tokenizer import SarkazTokenizer
 from dataset import SarkazDataset
@@ -36,15 +36,16 @@ def get_args():
     p.add_argument("--embedding-lr", type=float, default=8e-5, help="Learning rate for custom embeddings")
     p.add_argument("--bert-emb-lr", type=float, default=4e-5, help="Learning rate for BERT embeddings")
     p.add_argument("--bert-low-lr", type=float, default=2e-5, help="Learning rate for BERT encoder layers 1-4")
-    p.add_argument("--bert-mid-lr", type=float, default=1e-5, help="Learning rate for BERT encoder layers 5-8")
-    p.add_argument("--bert-high-lr", type=float, default=2e-5, help="Learning rate for BERT encoder layers 9-12 and pooler")
-    p.add_argument("--head-lr", type=float, default=8e-5, help="Learning rate for the mapper head")
+    p.add_argument("--bert-mid-lr", type=float, default=8e-6, help="Learning rate for BERT encoder layers 5-8")
+    p.add_argument("--bert-high-lr", type=float, default=2e-5, help="Learning rate for BERT encoder layers 9-12")
+    p.add_argument("--mlm-head-lr", type=float, default=2e-5, help="Learning rate for the pretrained MLM head")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--log-interval", type=int, default=100)
     p.add_argument("--validate-interval", type=int, default=2000, help="Validate every N steps (set to 0 to disable step-based validation)")
     p.add_argument("--enable-amp", type=bool, default=True, help="Enable automatic mixed precision for faster training and reduced memory usage")
     p.add_argument("--enable-gradient-checkpointing", type=bool, default=False, help="Enable gradient checkpointing to reduce GPU memory")
+    p.add_argument("--freeze-bert-epochs", type=int, default=1, help="Freeze the BERT backbone for the first N epochs")
     p.add_argument("--train-level", type=int, default=0, help="Current training level for multi-level training (default 0)")
     p.add_argument("--max-samples", type=int, default=0 , help="Limit number of samples, set to >0 for quick tests")
     p.add_argument("--loader-workers", type=int, default=4, help="Number of DataLoader workers")
@@ -117,10 +118,10 @@ def main():
     # 加载模型实例
     print("Creating model...")
     bert_model_dir = Path(__file__).resolve().parent / "bert-base-chinese"
-    bert = BertModel.from_pretrained(str(bert_model_dir))
-    model = SarkazBert(bert)
+    mlm_model = BertForMaskedLM.from_pretrained(str(bert_model_dir))
+    model = SarkazBert(mlm_model)
 
-    # 学习率分组：custom embedding / BERT embeddings / BERT low-mid-high / mapper head
+    # 学习率分组：custom embedding / BERT embeddings / BERT low-mid-high / MLM head
     bert_layers = model.bert_model.encoder.layer
 
     def layer_params(start: int, end: int):
@@ -129,18 +130,31 @@ def main():
             params.extend(layer.parameters())
         return params
 
-    # 池化层不使用
-    for param in model.bert_model.pooler.parameters():
-        param.requires_grad = False
+    def unique_params(module, seen_param_ids: set[int]):
+        params = []
+        for param in module.parameters():
+            if id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
+            params.append(param)
+        return params
+
+    seen_param_ids: set[int] = set()
+    embedding_params = unique_params(model.embedding, seen_param_ids)
+    bert_embedding_params = unique_params(model.bert_model.embeddings, seen_param_ids)
+    bert_low_params = unique_params(torch.nn.ModuleList(bert_layers[:4]), seen_param_ids)
+    bert_mid_params = unique_params(torch.nn.ModuleList(bert_layers[4:8]), seen_param_ids)
+    bert_high_params = unique_params(torch.nn.ModuleList(bert_layers[8:12]), seen_param_ids)
+    mlm_head_params = unique_params(model.mlm_head, seen_param_ids)
 
     optimizer = AdamW(
         [
-            {"params": model.embedding.parameters(), "lr": args.embedding_lr},
-            {"params": model.bert_model.embeddings.parameters(), "lr": args.bert_emb_lr},
-            {"params": layer_params(0, 4), "lr": args.bert_low_lr},
-            {"params": layer_params(4, 8), "lr": args.bert_mid_lr},
-            {"params": layer_params(8, 12), "lr": args.bert_high_lr},
-            {"params": model.mapper.parameters(), "lr": args.head_lr},
+            {"params": embedding_params, "lr": args.embedding_lr},
+            {"params": bert_embedding_params, "lr": args.bert_emb_lr},
+            {"params": bert_low_params, "lr": args.bert_low_lr},
+            {"params": bert_mid_params, "lr": args.bert_mid_lr},
+            {"params": bert_high_params, "lr": args.bert_high_lr},
+            {"params": mlm_head_params, "lr": args.mlm_head_lr},
         ]
     )
     print(
@@ -150,7 +164,7 @@ def main():
         f"bert_low_lr={args.bert_low_lr:.6g}, "
         f"bert_mid_lr={args.bert_mid_lr:.6g}, "
         f"bert_high_lr={args.bert_high_lr:.6g}, "
-        f"head_lr={args.head_lr:.6g}"
+        f"mlm_head_lr={args.mlm_head_lr:.6g}"
     )
     model_saver = ModelSaver(checkpoint_dir=str(checkpoint_dir))
 
@@ -214,6 +228,7 @@ def main():
         validate_interval=args.validate_interval,
         log_interval=args.log_interval,
         current_train_level=args.train_level,
+        freeze_bert_epochs=args.freeze_bert_epochs,
         summary_logger=summary_board,
         accumulation_steps=args.accumulation_steps
     )

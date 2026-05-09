@@ -27,6 +27,7 @@ class SarkazBertTrainer:
         validate_interval: int = 100,
         log_interval: int = 10,
         current_train_level: int = 0,
+        freeze_bert_epochs: int = 0,
         hard_mask: float = -1e4,
         sarkaz_mapping: SarkazCharmap = SarkazCharmap(),
         summary_logger: Optional[SummaryLogger] = None,
@@ -47,6 +48,7 @@ class SarkazBertTrainer:
         self.validate_interval = validate_interval
         self.log_interval = log_interval
         self.current_train_level = current_train_level
+        self.freeze_bert_epochs = max(0, freeze_bert_epochs)
         self.hard_mask = hard_mask
         self.sarkaz_mapping = sarkaz_mapping
         self.summary_logger = summary_logger
@@ -62,10 +64,30 @@ class SarkazBertTrainer:
         self.global_step = 0
         # 当在训练中触发早停时 标记以便上层循环结束 在本类中无使用
         self._should_early_stop = False
+        # 跟踪 BERT 主模型当前是否处于冻结状态，避免重复打印日志。
+        self._bert_is_trainable: Optional[bool] = None
         
         # 使用混合精度训练
         if self.enable_amp:
             self.grad_scaler = torch.amp.grad_scaler.GradScaler()
+
+    def _set_bert_trainable(self, trainable: bool) -> None:
+        if hasattr(self.model, "set_bert_trainable"):
+            self.model.set_bert_trainable(trainable)
+        else:
+            for param in self.model.bert_model.parameters():
+                param.requires_grad = trainable
+
+    def _apply_bert_freeze_for_epoch(self, epoch: int) -> None:
+        trainable = epoch >= self.freeze_bert_epochs
+        if self._bert_is_trainable is None or self._bert_is_trainable != trainable:
+            if self.freeze_bert_epochs > 0:
+                if trainable:
+                    print(f"[O] BERT backbone and MLM head unfrozen at epoch {epoch} (freeze first {self.freeze_bert_epochs} epochs)")
+                else:
+                    print(f"[O] BERT backbone and MLM head frozen for first {self.freeze_bert_epochs} epochs")
+            self._bert_is_trainable = trainable
+        self._set_bert_trainable(trainable)
 
     def _calc_loss(self, core_ids: torch.Tensor, output_logics: torch.Tensor, token_mask: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -74,7 +96,7 @@ class SarkazBertTrainer:
         Args:
             head_ids: Tensor of shape (batch, seq_len) — 头部 token IDs。
             core_ids: Tensor of shape (batch, seq_len) — 核心 token IDs。
-            output_logics: Tensor of shape (batch, seq_len, dict_size) — 模型预测的 logits（已由 mapper 切片）。
+            output_logics: Tensor of shape (batch, seq_len, dict_size) — 模型预测的 logits（已由 MLM head 切片到 dict_size）。
             token_mask: Tensor of shape (batch, seq_len) — 0/1 掩码，1 表示该位置参与损失计算。
             target_ids: Tensor of shape (batch, seq_len) — 目标 id。
 
@@ -94,17 +116,17 @@ class SarkazBertTrainer:
         # 硬规则帮助模型专注学习有效输出的特定子集，忽略无效位置的预测
         char_mask = self.sarkaz_mapping.map_core_ids(core_ids).to(self.device_str)
         # 目标 token 对应的 logits 位置必须保留，否则说明映射或数据存在错误
-        # token_mask_bool = token_mask.to(self.device_str).bool()
-        # target_allowed = char_mask.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1)
-        # target_allowed = target_allowed | ~token_mask_bool
-        # if not target_allowed.all():
-        #     bad_positions = (~target_allowed).nonzero(as_tuple=False)
-        #     first_bad = bad_positions[0].tolist()
-        #     bad_target_id = target_ids[first_bad[0], first_bad[1]].item()
-        #     raise RuntimeError(
-        #         "Target token is masked out by char_mask at position "
-        #         f"(batch={first_bad[0]}, seq={first_bad[1]}), target_id={bad_target_id}"
-        #     )
+        token_mask_bool = token_mask.to(self.device_str).bool()
+        target_allowed = char_mask.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1)
+        target_allowed = target_allowed | ~token_mask_bool
+        if not target_allowed.all():
+            bad_positions = (~target_allowed).nonzero(as_tuple=False)
+            first_bad = bad_positions[0].tolist()
+            bad_target_id = target_ids[first_bad[0], first_bad[1]].item()
+            raise RuntimeError(
+                "Target token is masked out by char_mask at position "
+                f"(batch={first_bad[0]}, seq={first_bad[1]}), target_id={bad_target_id}"
+            )
         # 应用硬规则掩码，将无效位置的 logits 设置为一个很小的值，使其在 softmax 后接近于 0
         output_logics = output_logics.masked_fill(~char_mask, self.hard_mask)
 
@@ -114,23 +136,21 @@ class SarkazBertTrainer:
         logits, targets, mask = self._flatten_core_logits(output_logics, target_ids, token_mask, vocab_size, ensure_device_str=self.device_str)
 
         # 在进入 criterion 前再检查一次：参与监督的位置上，目标类别的 logit 不能已经被 hard_mask 掉
-        # supervised_logits = 
-        # supervised_targets = 
-        # target_class_logits = supervised_logits.gather(1, supervised_targets.unsqueeze(1)).squeeze(1)
-        # bad_positions = (target_class_logits == self.hard_mask).nonzero(as_tuple=False).flatten()
-        # if bad_positions.numel() > 0:
-        #     first_bad = bad_positions[0].item()
-        #     flat_indices = mask.nonzero(as_tuple=False).squeeze(1)
-        #     flat_idx = flat_indices[first_bad].item()
-        #     batch_idx = flat_idx // token_mask.size(1)
-        #     seq_idx = flat_idx % token_mask.size(1)
-        #     bad_target_id = supervised_targets[first_bad].item()
-        #     raise RuntimeError(
-        #         "Target-class logit is hard-masked before criterion at position "
-        #         f"(batch={batch_idx}, seq={seq_idx}), target_id={bad_target_id}, hard_mask={self.hard_mask}"
-        #     )
-        #  = supervised_logits
-        #  = supervised_targets
+        supervised_logits = logits[mask]
+        supervised_targets = targets[mask]
+        target_class_logits = supervised_logits.gather(1, supervised_targets.unsqueeze(1)).squeeze(1)
+        bad_positions = (target_class_logits == self.hard_mask).nonzero(as_tuple=False).flatten()
+        if bad_positions.numel() > 0:
+            first_bad = bad_positions[0].item()
+            flat_indices = mask.nonzero(as_tuple=False).squeeze(1)
+            flat_idx = flat_indices[first_bad].item()
+            batch_idx = flat_idx // token_mask.size(1)
+            seq_idx = flat_idx % token_mask.size(1)
+            bad_target_id = supervised_targets[first_bad].item()
+            raise RuntimeError(
+                "Target-class logit is hard-masked before criterion at position "
+                f"(batch={batch_idx}, seq={seq_idx}), target_id={bad_target_id}, hard_mask={self.hard_mask}"
+            )
 
         # 如果没有有效位置，返回 0.0（带 grad）以避免断图
         # if mask.sum() == 0:
@@ -417,6 +437,8 @@ class SarkazBertTrainer:
         print(f"\nStarting training from epoch {self.current_epoch} (target {target_epochs} epochs)")
         
         for epoch in range(self.current_epoch, target_epochs):
+
+            self._apply_bert_freeze_for_epoch(epoch)
 
             self.current_epoch = epoch # 登记全局变量
             print(f"\n[Epoch {epoch}/{target_epochs}]")

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
 import torch
 from torch.amp.autocast_mode import autocast
-from transformers import BertModel
+from transformers import BertForMaskedLM
 
 from dataset import SarkazCharmap
 from sarkazBert import SarkazBert
@@ -26,13 +27,18 @@ PROJECT_ROOT = BASE_DIR.parent
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_BERT_DIR = BASE_DIR / "bert-base-chinese"
 
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
+
+from collect.encode import encode_text
+
 
 def get_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Interactive SarkazBert test script")
 	parser.add_argument("--checkpoint-dir", type=str, default=str(DEFAULT_CHECKPOINT_DIR))
 	parser.add_argument("--checkpoint-name", type=str, default="best")
 	parser.add_argument("--device", type=str, default=None)
-	parser.add_argument("--beam-width", type=int, default=5)
+	parser.add_argument("--beam-width", type=int, default=100)
 	parser.add_argument("--topk", type=int, default=5)
 	parser.add_argument(
 		"--default-t",
@@ -52,18 +58,19 @@ def resolve_checkpoint_dir(raw_path: str) -> Path:
 
 
 def pick_device(device_arg: str | None) -> torch.device:
+	device_ctor = getattr(torch, "device")
 	if device_arg:
-		return torch.device(device_arg)
+		return device_ctor(device_arg)
 	if torch.cuda.is_available():
-		return torch.device("cuda")
-	return torch.device("cpu")
+		return device_ctor("cuda")
+	return device_ctor("cpu")
 
 
 def load_model(device: torch.device, checkpoint_dir: Path, checkpoint_name: str) -> Tuple[SarkazBert, dict, SarkazTokenizer, SarkazCharmap]:
 	tokenizer = SarkazTokenizer()
 	charmap = SarkazCharmap()
-	bert_model = BertModel.from_pretrained(str(DEFAULT_BERT_DIR))
-	model = SarkazBert(bert_model)
+	mlm_model = BertForMaskedLM.from_pretrained(str(DEFAULT_BERT_DIR))
+	model = SarkazBert(mlm_model)
 
 	checkpoint_path = checkpoint_dir / f"{checkpoint_name}.pt"
 	if not checkpoint_path.exists():
@@ -77,18 +84,7 @@ def load_model(device: torch.device, checkpoint_dir: Path, checkpoint_name: str)
 	try:
 		model.load_state_dict(ck, strict=True)
 	except RuntimeError as e:
-		# Try a non-strict load and print helpful diagnostics so the user
-		# understands which keys differ between the checkpoint and current model.
-		print(f"Warning: strict state_dict load failed: {e}")
-		model_keys = set(model.state_dict().keys())
-		ck_keys = set(ck.keys())
-		missing = sorted(list(model_keys - ck_keys))
-		unexpected = sorted(list(ck_keys - model_keys))
-		if missing:
-			print(f"  Missing keys in checkpoint (will be randomly initialized): {len(missing)} examples, first 10 -> {missing[:10]}")
-		if unexpected:
-			print(f"  Unexpected keys in checkpoint (ignored): {len(unexpected)} examples, first 10 -> {unexpected[:10]}")
-		model.load_state_dict(ck, strict=False)
+		raise RuntimeError(f"Checkpoint structure mismatch: {checkpoint_path}. Original error: {e}") from e
 	model = model.to(device)
 	model.eval()
 	return model, checkpoint, tokenizer, charmap
@@ -113,7 +109,8 @@ def print_metadata(
 	print(f"Tokenizer vocab size: {len(tokenizer.id_to_token)}")
 	print(f"Supported input chars: {len(tokenizer._input_char_to_id)}")
 	print(f"Char map size: {len(charmap.chars)}")
-	print(f"Model dict size: {model.mapper.out_features}")
+	print(f"Model dict size: {model.dict_size}")
+	print(f"Output head: BertForMaskedLM.cls sliced to {model.dict_size} logits")
 	print(f"BERT hidden size: {bert_cfg.hidden_size}")
 	print(f"BERT layers: {bert_cfg.num_hidden_layers}")
 	print(f"AMP on CUDA: {device.type == 'cuda'}")
@@ -131,22 +128,32 @@ def parse_user_input(raw_text: str, default_t: int) -> Tuple[int, str]:
 	return default_t, text
 
 
-def build_inputs(tokenizer: SarkazTokenizer, t: int, input_text: str, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def prepare_input_text(tokenizer: SarkazTokenizer, raw_text: str) -> Tuple[str, bool]:
+	normalized = tokenizer._normalize(raw_text)
+	allowed_chars = set("abcdefghijklmnopqrstuvwxyz[]|;")
+	if all(ch in allowed_chars for ch in normalized):
+		return raw_text, False
+	return encode_text(raw_text, recognize_marks=True), True
+
+
+def build_inputs(tokenizer: SarkazTokenizer, t: int, input_text: str, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	normalized = tokenizer._normalize(input_text)
 	if not normalized:
 		raise ValueError("输入不能为空")
 
-	unknown_chars = [ch for ch in normalized if ch not in "abcdefghijklmnopqrstuvwxyz"]
+	unknown_chars = [ch for ch in normalized if ch not in "abcdefghijklmnopqrstuvwxyz[]|;"]
 	if unknown_chars:
 		unique_unknown = "".join(dict.fromkeys(unknown_chars))
-		raise ValueError(f"输入包含未支持字符: {unique_unknown}. 这里只支持 a-z")
+		raise ValueError(f"输入包含未支持字符: {unique_unknown}. 请先编码后再输入模型")
 
 	core_ids, _ = tokenizer._encode_core(normalized)
 	head_token_ids = [tokenizer.cls_id, tokenizer.magic_id_0 if t == 0 else tokenizer.magic_id_1, tokenizer.sep_id]
 	head_ids = torch.tensor([head_token_ids], dtype=torch.long, device=device)
 	core_ids = torch.tensor([core_ids], dtype=torch.long, device=device)
 	attention_mask = torch.ones((1, head_ids.size(1) + core_ids.size(1)), dtype=torch.long, device=device)
-	return head_ids, core_ids, attention_mask
+	sequence_ids = torch.cat([head_ids, core_ids], dim=1)
+	token_type_ids = torch.tensor([tokenizer._build_token_type_ids(sequence_ids[0].tolist())], dtype=torch.long, device=device)
+	return head_ids, core_ids, attention_mask, token_type_ids
 
 
 def infer_logits(
@@ -155,14 +162,15 @@ def infer_logits(
 	head_ids: torch.Tensor,
 	core_ids: torch.Tensor,
 	attention_mask: torch.Tensor,
+	token_type_ids: torch.Tensor,
 	device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 	with torch.inference_mode():
 		if device.type == "cuda":
 			with autocast(device_type="cuda"):
-				logits = model(head_ids, core_ids, attention_mask)
+				logits = model(head_ids, core_ids, attention_mask, token_type_ids)
 		else:
-			logits = model(head_ids, core_ids, attention_mask)
+			logits = model(head_ids, core_ids, attention_mask, token_type_ids)
 
 		char_mask = charmap.map_core_ids(core_ids)
 		masked_logits = logits.masked_fill(~char_mask, -1e4)
@@ -231,14 +239,17 @@ def run_once(
 	beam_width: int,
 	topk: int,
 ) -> None:
-	head_ids, core_ids, attention_mask = build_inputs(tokenizer, t, input_text, device)
-	masked_logits, probabilities = infer_logits(model, charmap, head_ids, core_ids, attention_mask, device)
+	prepared_input, encoded = prepare_input_text(tokenizer, input_text)
+	if encoded:
+		print(f"[!] 输入包含不支持字符，已先执行 encode 编码后送入模型: {prepared_input}")
+	head_ids, core_ids, attention_mask, token_type_ids = build_inputs(tokenizer, t, prepared_input, device)
+	masked_logits, probabilities = infer_logits(model, charmap, head_ids, core_ids, attention_mask, token_type_ids, device)
 	top1_sentence, _ = greedy_sentence(tokenizer, probabilities)
 	beam_sentence, _, beam_score = beam_search_sentence(tokenizer, probabilities, beam_width=beam_width)
 
 	print(f"Input: {tokenizer._normalize(input_text)}")
-	print(f"Top1: {top1_sentence}")
-	print(f"Top5: {beam_sentence} (score={beam_score:.4f})")
+	print(f"Top1  : {top1_sentence}")
+	print(f"Top100: {beam_sentence} (score={beam_score:.4f})")
 	print(f"Length: {masked_logits.size(1)} positions")
 	print_topk_table(tokenizer, probabilities, topk=topk)
 

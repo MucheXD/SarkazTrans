@@ -1,4 +1,5 @@
 .venv/
+resources/
 *.pyc
 **/__pycache__/
 collect/data/json/

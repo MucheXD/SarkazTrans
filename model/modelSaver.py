@@ -178,5 +178,8 @@ class ModelSaver:
             self.best_score = best_score
             return level_epoch, best_score, True
         except Exception as e:
-            print(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            print(
+                f"Failed to load checkpoint {checkpoint_path}: {e}. "
+                "This runtime expects MLM-head checkpoints; old mapper checkpoints are not supported."
+            )
             return 0, float('-inf'), False
