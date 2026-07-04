@@ -1,4 +1,5 @@
 .venv/
+test/
 resources/
 *.pyc
 **/__pycache__/

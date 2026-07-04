@@ -16,9 +16,9 @@ class SarkazBert(nn.Module):
     # Layer1 - Reconstructor
     self.embedding = nn.Embedding(num_embeddings=30, embedding_dim=768)
     self.reconstructor_mlp = nn.Sequential(
-      nn.Linear(768, 768),
+      nn.Linear(768, 1024),
       nn.GELU(),
-      nn.Linear(768, 768),
+      nn.Linear(1024, 768),
       nn.Dropout(0.2)
     )
     self.reconstructor_norm = nn.LayerNorm(768)

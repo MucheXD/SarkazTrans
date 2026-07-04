@@ -1,6 +1,7 @@
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
 from sarkazBert import SarkazBert
 from modelSaver import ModelSaver
@@ -30,6 +31,8 @@ class SarkazBertTrainer:
         freeze_bert_epochs: int = 0,
         hard_mask: float = -1e4,
         sarkaz_mapping: SarkazCharmap = SarkazCharmap(),
+        teacher_model: Optional[Any] = None,
+        teacher_temperature: float = 1.0,
         summary_logger: Optional[SummaryLogger] = None,
     ):
         # 延迟将模型搬到 GPU，在 train() 开始时执行，避免与加载检查点重复占用显存
@@ -51,6 +54,9 @@ class SarkazBertTrainer:
         self.freeze_bert_epochs = max(0, freeze_bert_epochs)
         self.hard_mask = hard_mask
         self.sarkaz_mapping = sarkaz_mapping
+        self.teacher_model = teacher_model
+        self.teacher_temperature = teacher_temperature
+        self.use_teacher_supervision = self.teacher_model is not None and self.teacher_temperature > 0
         self.summary_logger = summary_logger
         
         # 训练状态跟踪
@@ -89,16 +95,23 @@ class SarkazBertTrainer:
             self._bert_is_trainable = trainable
         self._set_bert_trainable(trainable)
 
-    def _calc_loss(self, core_ids: torch.Tensor, output_logics: torch.Tensor, token_mask: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    def _calc_loss(
+        self,
+        core_ids: torch.Tensor,
+        output_logics: torch.Tensor,
+        token_mask: torch.Tensor,
+        target_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        计算掩码后的交叉熵损失。
+        计算掩码后的 KL 散度损失。
 
         Args:
             head_ids: Tensor of shape (batch, seq_len) — 头部 token IDs。
             core_ids: Tensor of shape (batch, seq_len) — 核心 token IDs。
             output_logics: Tensor of shape (batch, seq_len, dict_size) — 模型预测的 logits（已由 MLM head 切片到 dict_size）。
             token_mask: Tensor of shape (batch, seq_len) — 0/1 掩码，1 表示该位置参与损失计算。
-            target_ids: Tensor of shape (batch, seq_len) — 目标 id。
+            target_ids: Tensor of shape (batch, seq_len) — 目标 id，后续会展开成 one-hot 分布。
 
         Returns:
             标量损失张量（可反向传播）。
@@ -112,12 +125,26 @@ class SarkazBertTrainer:
         tar_batch_size, tar_seq_len = target_ids.size()
         assert batch_size == tar_batch_size and seq_len == tar_seq_len, "Output logits and target ids must have matching batch and sequence dimensions"
 
+        def _pad_vocab_dim(tensor: torch.Tensor, target_vocab_size: int, fill_value: float | bool) -> torch.Tensor:
+            current_vocab_size = tensor.size(-1)
+            if current_vocab_size == target_vocab_size:
+                return tensor
+            if current_vocab_size > target_vocab_size:
+                return tensor[..., :target_vocab_size]
+            pad_shape = (*tensor.shape[:-1], target_vocab_size - current_vocab_size)
+            pad_tensor = tensor.new_full(pad_shape, fill_value)
+            return torch.cat([tensor, pad_tensor], dim=-1)
+
         # 获取硬规则掩码
         # 硬规则帮助模型专注学习有效输出的特定子集，忽略无效位置的预测
-        char_mask = self.sarkaz_mapping.map_core_ids(core_ids).to(self.device_str)
+        raw_char_mask = self.sarkaz_mapping.map_core_ids(core_ids).to(self.device_str)
+        student_vocab_size = vocab_size
+        student_mask_vocab_size = max(student_vocab_size, raw_char_mask.size(-1))
+        student_output_logics = _pad_vocab_dim(output_logics, student_mask_vocab_size, self.hard_mask)
+        student_char_mask = _pad_vocab_dim(raw_char_mask, student_mask_vocab_size, False)
         # 目标 token 对应的 logits 位置必须保留，否则说明映射或数据存在错误
         token_mask_bool = token_mask.to(self.device_str).bool()
-        target_allowed = char_mask.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1)
+        target_allowed = student_char_mask.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1)
         target_allowed = target_allowed | ~token_mask_bool
         if not target_allowed.all():
             bad_positions = (~target_allowed).nonzero(as_tuple=False)
@@ -128,13 +155,46 @@ class SarkazBertTrainer:
                 f"(batch={first_bad[0]}, seq={first_bad[1]}), target_id={bad_target_id}"
             )
         # 应用硬规则掩码，将无效位置的 logits 设置为一个很小的值，使其在 softmax 后接近于 0
-        output_logics = output_logics.masked_fill(~char_mask, self.hard_mask)
+        student_output_logics = student_output_logics.masked_fill(~student_char_mask, self.hard_mask)
 
-        # ensure token_mask and target_ids are tensors on same device
-        # token mask 用于标记有效序列中输入的特殊字符，在输出中对应位置不做比较
-        # 例如：输入 aaa[bb]ccc 输出的 4,7 位置不做损失计算
-        logits, targets, mask = self._flatten_core_logits(output_logics, target_ids, token_mask, vocab_size, ensure_device_str=self.device_str)
+        # 展平后，仅对 token_mask 参与监督的位置构造 KLDiv 所需的输入/目标。
+        logits, targets, mask = self._flatten_core_logits(
+            student_output_logics[..., :student_vocab_size],
+            target_ids,
+            token_mask,
+            student_vocab_size,
+            ensure_device_str=self.device_str,
+        )
 
+        # === 教师监督学习模式 ===
+        if self.use_teacher_supervision:
+            teacher_attention_mask = core_ids.ne(0).long()
+            with torch.inference_mode():
+                # 教师模型输出形状: (batch_size, seq_len, 21128)
+                teacher_logits = self.teacher_model.Answer(core_ids, teacher_attention_mask)
+            teacher_logits = teacher_logits.to(self.device_str)
+            
+            # 1. 将教师模型的词表维度动态对齐到学生模型的词表维度 (例如 21128 -> 8100)
+            teacher_logits_rescaled = _pad_vocab_dim(teacher_logits, student_vocab_size, self.hard_mask)
+            
+            # 2. 对教师模型同样应用硬规则掩码 (截取与当前学生词表一致的前缀掩码)
+            student_char_mask_sliced = student_char_mask[..., :student_vocab_size]
+            teacher_logits_rescaled = teacher_logits_rescaled.masked_fill(~student_char_mask_sliced, self.hard_mask)
+            
+            # 3. 将教师模型的 logits 展平为 2D 形状: (batch_size * seq_len, student_vocab_size)
+            teacher_logits_flat = teacher_logits_rescaled.contiguous().view(-1, student_vocab_size)
+            
+            # 4. 核心修复：复用前面第140行已经安全展平的学生 logits 和 1D mask [5632] 进行切片
+            supervised_student_logits = logits[mask]
+            supervised_teacher_logits = teacher_logits_flat[mask]
+            
+            # 5. 计算知识蒸馏损失
+            temperature = self.teacher_temperature
+            student_log_probs = F.log_softmax(supervised_student_logits / temperature, dim=-1)
+            teacher_log_probs = F.log_softmax(supervised_teacher_logits / temperature, dim=-1)
+            return F.kl_div(student_log_probs, teacher_log_probs, reduction="batchmean", log_target=True) * (temperature * temperature)
+
+        # === 仅使用 KLDivLoss 计算损失 ===
         # 在进入 criterion 前再检查一次：参与监督的位置上，目标类别的 logit 不能已经被 hard_mask 掉
         supervised_logits = logits[mask]
         supervised_targets = targets[mask]
@@ -152,13 +212,13 @@ class SarkazBertTrainer:
                 f"(batch={batch_idx}, seq={seq_idx}), target_id={bad_target_id}, hard_mask={self.hard_mask}"
             )
 
-        # 如果没有有效位置，返回 0.0（带 grad）以避免断图
-        # if mask.sum() == 0:
-        #     return torch.tensor(0.0, device=self.device_str, requires_grad=True)
-
         assert mask.sum() > 0, "No valid positions to compute loss (token_mask may be all zeros)"
 
-        return self.criterion(logits[mask], targets[mask])
+        # KLDivLoss 需要输入 log-probabilities 和与之同形状的目标分布。
+        log_probs = F.log_softmax(supervised_logits, dim=-1)
+        target_probs = F.one_hot(supervised_targets, num_classes=vocab_size).to(dtype=log_probs.dtype)
+
+        return self.criterion(log_probs, target_probs)
 
     def token_accuracy(
         self,
@@ -276,10 +336,10 @@ class SarkazBertTrainer:
             if self.enable_amp:
                 with autocast(device_type=self.device_str):
                     output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
-                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
+                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids, attention_mask)
             else:
                 output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
-                loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
+                loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids, attention_mask)
 
             # 对损失进行缩放以实现梯度累积
             scaled_loss = loss / self.accumulation_steps
@@ -369,10 +429,10 @@ class SarkazBertTrainer:
                 if self.enable_amp:
                     with autocast(device_type=self.device_str):
                         output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
-                        loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
+                        loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids, attention_mask)
                 else:
                     output_logits = self.model(head_ids, core_ids, attention_mask, token_type_ids)
-                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids)
+                    loss = self._calc_loss(core_ids, output_logits, token_mask, target_ids, attention_mask)
                 
                 # Compute metrics (top1 and top5)
                 logits_flat, targets_flat, mask_flat = self._flatten_core_logits(output_logits, target_ids, token_mask, output_logits.size(-1), ensure_device_str=self.device_str)
