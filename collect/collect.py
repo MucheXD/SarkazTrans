@@ -9,9 +9,8 @@ import requests
 
 from deserialize import wikidat_deserialize
 
-
+# 此脚本从 warfarin.wiki 采集数据
 BASE_URL = "https://warfarin.wiki/cn"
-
 
 def _ensure_dirs(base_dir: Path) -> Dict[str, Path]:
     raw_dir = base_dir / "data" / "raw"
