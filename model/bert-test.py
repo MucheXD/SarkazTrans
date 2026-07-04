@@ -107,7 +107,7 @@ def predict_topk_for_text(
 			logits[special_index] = float("-inf")
 
 		k = min(topk, logits.numel())
-		probs = torch.log_softmax(logits / temperature, dim=-1)
+		probs = torch.softmax(logits / temperature, dim=-1)
 		source_prob = float(probs[original_token_id].item())
 		top_probs, top_ids = torch.topk(probs, k=k)
 		candidates: List[Tuple[str, float]] = []

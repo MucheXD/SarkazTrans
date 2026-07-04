@@ -57,6 +57,14 @@ def _normalize_display_token(token: str | None) -> str:
 
 
 class TeacherModel:
+    """BERT MLM teacher that scores each requested position by masking it first.
+
+    `target_ids` and `attention_mask` describe the teacher-side text sequence without
+    [CLS]/[SEP]. `token_mask` selects which non-padding positions should be predicted.
+    This distinction is important: token_mask excludes non-output delimiters, while
+    attention_mask excludes only padding.
+    """
+
     def __init__(self, model_dir: str | Path = DEFAULT_MODEL_DIR, device: str | torch.device | None = None):
         self.device = _pick_device(str(device) if isinstance(device, torch.device) else device)
         self.model_dir = Path(model_dir)
@@ -76,8 +84,28 @@ class TeacherModel:
         self,
         target_ids: Sequence[int] | torch.Tensor,
         attention_mask: Sequence[int] | torch.Tensor,
-        vector_chunk_size: int = 1024  # 显存安全块大小，1024 既能跑满 GPU 又防 OOM
+        token_mask: Sequence[int] | torch.Tensor | None = None,
+        vector_chunk_size: int = 64,
     ) -> torch.Tensor:
+        """Return per-position logits from repeated masked-token forward passes.
+
+        Args:
+            target_ids: Tensor/list with shape (batch, seq_len). These are BERT
+                vocabulary ids for the teacher context.
+            attention_mask: Same shape. 1 means the position is real context, 0 padding.
+            token_mask: Optional same-shape mask. 1 means this position should be
+                masked and predicted. If omitted, every attention_mask==1 position is
+                predicted.
+            vector_chunk_size: Number of masked sequences evaluated per teacher call.
+                Lower it if a 12G GPU still OOMs on long sequences.
+
+        Returns:
+            Float32 tensor with shape (batch, seq_len, teacher_vocab_size). Positions
+            not selected by token_mask are all zeros.
+        """
+        if vector_chunk_size <= 0:
+            raise ValueError("vector_chunk_size must be positive")
+
         target_ids_tensor = _as_tensor(target_ids, self.device)
         attention_mask_tensor = _as_tensor(attention_mask, self.device)
 
@@ -86,62 +114,86 @@ class TeacherModel:
                 f"target_ids shape {tuple(target_ids_tensor.shape)} must match attention_mask shape {tuple(attention_mask_tensor.shape)}"
             )
 
+        if token_mask is None:
+            prediction_mask = attention_mask_tensor.bool()
+        else:
+            token_mask_tensor = _as_tensor(token_mask, self.device)
+            if token_mask_tensor.shape != target_ids_tensor.shape:
+                raise ValueError(
+                    f"token_mask shape {tuple(token_mask_tensor.shape)} must match target_ids shape {tuple(target_ids_tensor.shape)}"
+                )
+            prediction_mask = token_mask_tensor.bool() & attention_mask_tensor.bool()
+
         batch_size, seq_len = target_ids_tensor.shape
-        
-        # 1. 构建基础包裹 Tensor (自动补上开头的 CLS 和结尾的 SEP)
-        wrapped_input_ids = torch.full((batch_size, seq_len + 2), self.pad_token_id, dtype=torch.long, device=self.device)
-        wrapped_attention_mask = torch.zeros((batch_size, seq_len + 2), dtype=torch.long, device=self.device)
-        wrapped_token_type_ids = torch.zeros((batch_size, seq_len + 2), dtype=torch.long, device=self.device)
+        attention_mask_bool = attention_mask_tensor.bool()
+
+        wrapped_len = seq_len + 2
+        wrapped_input_ids = torch.full(
+            (batch_size, wrapped_len), self.pad_token_id, dtype=torch.long, device=self.device
+        )
+        wrapped_attention_mask = torch.zeros((batch_size, wrapped_len), dtype=torch.long, device=self.device)
+        wrapped_token_type_ids = torch.zeros((batch_size, wrapped_len), dtype=torch.long, device=self.device)
 
         wrapped_input_ids[:, 0] = self.cls_token_id
-        wrapped_input_ids[:, 1:-1] = target_ids_tensor
-        wrapped_input_ids[:, -1] = self.sep_token_id
+        wrapped_input_ids[:, 1 : seq_len + 1] = target_ids_tensor
         wrapped_attention_mask[:, 0] = 1
-        wrapped_attention_mask[:, 1:-1] = attention_mask_tensor
-        wrapped_attention_mask[:, -1] = 1
+        wrapped_attention_mask[:, 1 : seq_len + 1] = attention_mask_tensor.long()
 
-        # 2. 找出全 Batch 所有的有效 Token 位置 (得到二维坐标矩阵: [num_masked, 2])
-        # 每行代表 [哪个样本, 哪个Token位置]
-        valid_indices = torch.nonzero(attention_mask_tensor)
-        num_masked = valid_indices.size(0)
+        # Put SEP immediately after the last real token for each sample. This avoids
+        # placing SEP after padding when the batch contains mixed lengths.
+        lengths = attention_mask_tensor.long().sum(dim=1).clamp(min=0, max=seq_len)
+        batch_arange = torch.arange(batch_size, device=self.device)
+        sep_cols = lengths + 1
+        wrapped_input_ids[batch_arange, sep_cols] = self.sep_token_id
+        wrapped_attention_mask[batch_arange, sep_cols] = 1
 
-        result = torch.zeros((batch_size, seq_len, self.model.config.vocab_size), dtype=torch.float32, device=self.device)
+        valid_indices = torch.nonzero(prediction_mask, as_tuple=False)
+        num_masked = int(valid_indices.size(0))
+        result = torch.zeros(
+            (batch_size, seq_len, self.model.config.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if num_masked == 0:
+            return result
 
+        device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        use_amp = device_type == "cuda"
         with torch.inference_mode():
-            device_type = "cuda" if self.device.type == "cuda" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                
-                # 3. 分块进行大矩阵广播，将原来的几千次循环压缩为 2~4 次大矩阵运算
+            with torch.autocast(device_type=device_type, enabled=use_amp):
                 for start_idx in range(0, num_masked, vector_chunk_size):
                     end_idx = min(start_idx + vector_chunk_size, num_masked)
                     chunk_indices = valid_indices[start_idx:end_idx]
-                    chunk_b_size = chunk_indices.size(0)
-                    
-                    # 矩阵广播：根据 batch_idx 批量复制对应的整条包裹序列
-                    batch_maps = chunk_indices[:, 0]
-                    chunk_input_ids = wrapped_input_ids[batch_maps].clone()
-                    chunk_att_mask = wrapped_attention_mask[batch_maps]
-                    chunk_type_ids = wrapped_token_type_ids[batch_maps]
-                    
-                    # 批量高级索引打上 [MASK] (因为前面插了 CLS，所以列索引在 target_ids 基础上 +1)
-                    mask_cols = chunk_indices[:, 1] + 1
-                    row_arr = torch.arange(chunk_b_size, device=self.device)
-                    chunk_input_ids[row_arr, mask_cols] = self.mask_token_id
-                    
-                    # 并行前向传播
-                    outputs = self.model(
+                    chunk_size = int(chunk_indices.size(0))
+
+                    source_rows = chunk_indices[:, 0]
+                    mask_cols = chunk_indices[:, 1] + 1  # shifted by inserted CLS
+                    row_arange = torch.arange(chunk_size, device=self.device)
+
+                    chunk_input_ids = wrapped_input_ids[source_rows].clone()
+                    chunk_attention_mask = wrapped_attention_mask[source_rows]
+                    chunk_token_type_ids = wrapped_token_type_ids[source_rows]
+                    chunk_input_ids[row_arange, mask_cols] = self.mask_token_id
+
+                    # Run only the encoder, then apply the MLM head only to the masked
+                    # hidden states. This avoids materializing (chunk, seq, vocab) logits.
+                    bert_outputs = self.model.bert(
                         input_ids=chunk_input_ids,
-                        attention_mask=chunk_att_mask,
-                        token_type_ids=chunk_type_ids
+                        attention_mask=chunk_attention_mask,
+                        token_type_ids=chunk_token_type_ids,
+                        return_dict=True,
                     )
-                    
-                    # 4. 提取当前块中所有被 MASK 位置对应的预测 logits
-                    chunk_logits = outputs.logits[row_arr, mask_cols].to(dtype=result.dtype)
-                    
-                    # 利用高级散落索引（Advanced Scatter Indexing）一次性写回结果矩阵对应的坐标位置
+                    masked_hidden = bert_outputs.last_hidden_state[row_arange, mask_cols]
+                    chunk_logits = self.model.cls(masked_hidden.unsqueeze(1)).squeeze(1).to(dtype=result.dtype)
                     result[chunk_indices[:, 0], chunk_indices[:, 1]] = chunk_logits
 
         return result
+
+    def unload(self) -> None:
+        self.model.to("cpu")
+        del self.model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _encode_input(tokenizer: SarkazTokenizer, raw_text: str) -> torch.Tensor:
@@ -218,6 +270,7 @@ def _get_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--vector-chunk-size", type=int, default=64)
     return parser.parse_args()
 
 
@@ -232,7 +285,12 @@ def main() -> None:
         try:
             target_ids = _encode_input(teacher.tokenizer, raw_text)
             attention_mask = _build_attention_mask(target_ids)
-            logits = teacher.Answer(target_ids, attention_mask)
+            logits = teacher.Answer(
+                target_ids,
+                attention_mask,
+                token_mask=attention_mask,
+                vector_chunk_size=args.vector_chunk_size,
+            )
             _print_topk_table(teacher.tokenizer, logits, target_ids, args.temperature, args.topk)
         except Exception as exc:
             print(f"Error: {exc}")

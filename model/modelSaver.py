@@ -100,7 +100,7 @@ class ModelSaver:
             return 0, float('-inf'), False
         
         try:
-            checkpoint = torch.load(checkpoint_path, weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             
             # At minimum we require model weights to proceed; other keys may be
             # intentionally absent if a previous level transition cleared them.
